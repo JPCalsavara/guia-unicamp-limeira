@@ -1,17 +1,24 @@
 'use client';
 
 import { useEffect, useRef, useCallback } from 'react';
+import { trackEvent } from '@/lib/analytics';
 
 export interface UseTopicTrackerOptions {
   topicId: string;
   topicTitle: string;
   minDwellSeconds?: number;
+  course?: string;
+  campus?: string;
+  stage?: string;
 }
 
 export function useTopicTracker({
   topicId,
   topicTitle,
   minDwellSeconds = 2,
+  course,
+  campus,
+  stage,
 }: UseTopicTrackerOptions) {
   const elementRef = useRef<HTMLElement | null>(null);
   const visibleStartTimeRef = useRef<number | null>(null);
@@ -34,11 +41,20 @@ export function useTopicTracker({
     return Math.min(100, Math.round(((scrollTop + windowHeight) / docHeight) * 100));
   }, []);
 
+  const flushVisibleTime = useCallback(() => {
+    if (visibleStartTimeRef.current) {
+      const duration = (Date.now() - visibleStartTimeRef.current) / 1000;
+      totalDwellSecondsRef.current += duration;
+      visibleStartTimeRef.current = null;
+    }
+  }, []);
+
   const sendTelemetry = useCallback(
-    (forcedInteracted?: boolean, forcedType?: string) => {
+    (forcedInteracted?: boolean, forcedType?: string, targetHref?: string) => {
       if (typeof window === 'undefined') return;
 
-      const isMobile = window.innerWidth <= 768 || /Android|iPhone|iPad/i.test(navigator.userAgent);
+      const isMobile =
+        window.innerWidth <= 768 || /Android|iPhone|iPad/i.test(navigator.userAgent);
       const scrollDepth = calculateScrollDepth();
       const dwellSeconds = Math.round(totalDwellSecondsRef.current);
       const didInteract = forcedInteracted ?? interactedRef.current;
@@ -48,7 +64,7 @@ export function useTopicTracker({
         return;
       }
 
-      const payload = {
+      trackEvent({
         topicId,
         topicTitle,
         dwellTimeSeconds: dwellSeconds,
@@ -56,33 +72,25 @@ export function useTopicTracker({
         scrollDepthPct: scrollDepth,
         interacted: didInteract,
         interactionType: type,
-        timestamp: new Date().toISOString(),
-      };
-
-      const payloadBlob = new Blob([JSON.stringify(payload)], { type: 'application/json' });
-      if (navigator.sendBeacon) {
-        navigator.sendBeacon('/api/telemetry', payloadBlob);
-      } else {
-        fetch('/api/telemetry', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(payload),
-          keepalive: true,
-        }).catch(() => {});
-      }
+        course,
+        campus,
+        stage,
+        targetHref,
+      });
 
       hasSentRef.current = true;
     },
-    [topicId, topicTitle, minDwellSeconds, calculateScrollDepth]
+    [topicId, topicTitle, minDwellSeconds, course, campus, stage, calculateScrollDepth]
   );
 
   const recordInteraction = useCallback(
-    (interactionType = 'click') => {
+    (interactionType = 'click', targetHref?: string) => {
       interactedRef.current = true;
       interactionTypeRef.current = interactionType;
-      sendTelemetry(true, interactionType);
+      flushVisibleTime();
+      sendTelemetry(true, interactionType, targetHref);
     },
-    [sendTelemetry]
+    [flushVisibleTime, sendTelemetry]
   );
 
   useEffect(() => {
@@ -94,10 +102,8 @@ export function useTopicTracker({
         entries.forEach((entry) => {
           if (entry.isIntersecting) {
             visibleStartTimeRef.current = Date.now();
-          } else if (visibleStartTimeRef.current) {
-            const duration = (Date.now() - visibleStartTimeRef.current) / 1000;
-            totalDwellSecondsRef.current += duration;
-            visibleStartTimeRef.current = null;
+          } else {
+            flushVisibleTime();
           }
         });
       },
@@ -108,32 +114,34 @@ export function useTopicTracker({
 
     observer.observe(targetElement);
 
-    const handleBeforeUnload = () => {
-      if (visibleStartTimeRef.current) {
-        const duration = (Date.now() - visibleStartTimeRef.current) / 1000;
-        totalDwellSecondsRef.current += duration;
-        visibleStartTimeRef.current = null;
-      }
+    const flushAndSend = () => {
+      flushVisibleTime();
       if (!hasSentRef.current) {
         sendTelemetry();
       }
     };
 
-    window.addEventListener('beforeunload', handleBeforeUnload);
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === 'hidden') {
+        flushAndSend();
+      }
+    };
+
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+    window.addEventListener('pagehide', flushAndSend);
+    window.addEventListener('beforeunload', flushAndSend);
 
     return () => {
       observer.disconnect();
-      window.removeEventListener('beforeunload', handleBeforeUnload);
-      if (visibleStartTimeRef.current) {
-        const duration = (Date.now() - visibleStartTimeRef.current) / 1000;
-        totalDwellSecondsRef.current += duration;
-        visibleStartTimeRef.current = null;
-      }
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
+      window.removeEventListener('pagehide', flushAndSend);
+      window.removeEventListener('beforeunload', flushAndSend);
+      flushVisibleTime();
       if (!hasSentRef.current && totalDwellSecondsRef.current >= minDwellSeconds) {
         sendTelemetry();
       }
     };
-  }, [minDwellSeconds, sendTelemetry]);
+  }, [minDwellSeconds, flushVisibleTime, sendTelemetry]);
 
   return {
     ref: elementRef,
